@@ -19,7 +19,7 @@ CONFIG_FILE = Path("gw2_monitor_config.json")
 APP_TITLE = "GW2 Background Monitor"
 
 LEGACY_TEMPLATE = "{mention} {exe_name} {event}\nTime: {time}\nSession: {session_length}\nPID: {pid}"
-DEFAULT_TEMPLATE = "{mention} {exe_name} {event}\nTime: {time}\nPID: {pid}"
+DEFAULT_TEMPLATE = "{mention} ``{exe_name}`` {event}\nUptime: {uptime}\nTime: {time}\nPID: {pid}"
 
 DEFAULT_CONFIG = {
     "target_exe": "GW2.Main_Win64_Retail.exe",
@@ -73,6 +73,7 @@ WM_CLOSE = 0x0010
 
 DETECTION_STABLE_POLLS = 3
 MISSED_POLLS_FOR_CLOSE = 3
+POST_LAUNCH_CLOSE_GRACE_SECONDS = 12
 
 user32 = ctypes.windll.user32
 EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
@@ -181,6 +182,7 @@ class GW2MonitorApp(ctk.CTk):
         self.tray_thread = None
         self.tray_visible = False
         self.is_quitting = False
+        self.suppress_unexpected_close_until = 0.0
 
         self.pending_pid = None
         self.pending_start_time = None
@@ -199,6 +201,7 @@ class GW2MonitorApp(ctk.CTk):
             return DEFAULT_TEMPLATE
         template = template.replace("\r\n", "\n")
         template = template.replace("\nSession: {session_length}", "")
+        template = template.replace("Session: {session_length}\n", "")
         if template.strip() == LEGACY_TEMPLATE.replace("\nSession: {session_length}", "").strip():
             return DEFAULT_TEMPLATE
         return template
@@ -823,6 +826,7 @@ class GW2MonitorApp(ctk.CTk):
         self.push_log("INFO", "Moved to tray")
 
     def restore_from_tray(self):
+        self.stop_tray_icon()
         self.deiconify()
         self.lift()
         self.focus_force()
@@ -889,10 +893,16 @@ class GW2MonitorApp(ctk.CTk):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     def find_process(self, target_exe, preferred_path):
-        preferred_path_norm = str(Path(preferred_path).resolve()).lower() if preferred_path else ""
+        preferred_path_norm = ""
+        if preferred_path:
+            try:
+                preferred_path_norm = str(Path(preferred_path).resolve()).lower()
+            except Exception:
+                preferred_path_norm = str(preferred_path).lower()
+
         candidates = []
 
-        for proc in psutil.process_iter(["pid", "name", "exe"]):
+        for proc in psutil.process_iter(["pid", "name", "exe", "create_time"]):
             try:
                 name = proc.info.get("name") or ""
                 exe = proc.info.get("exe") or ""
@@ -904,16 +914,18 @@ class GW2MonitorApp(ctk.CTk):
         if not candidates:
             return None
 
-        for proc in candidates:
-            try:
-                exe = proc.exe() or ""
-                if preferred_path_norm and str(Path(exe).resolve()).lower() == preferred_path_norm:
-                    return proc
-            except Exception:
-                continue
+        if preferred_path_norm:
+            for proc in candidates:
+                try:
+                    exe = proc.exe() or ""
+                    resolved = str(Path(exe).resolve()).lower()
+                    if resolved == preferred_path_norm:
+                        return proc
+                except Exception:
+                    continue
 
         try:
-            candidates.sort(key=lambda item: item.create_time())
+            candidates.sort(key=lambda item: item.create_time(), reverse=True)
         except Exception:
             pass
 
@@ -1046,10 +1058,14 @@ class GW2MonitorApp(ctk.CTk):
             raise FileNotFoundError("Game path does not exist")
         subprocess.Popen([path], cwd=str(Path(path).parent))
 
+    def register_launch_grace_period(self):
+        self.suppress_unexpected_close_until = time.time() + POST_LAUNCH_CLOSE_GRACE_SECONDS
+
     def launch_game_manual(self):
         config = self.get_runtime_config()
         try:
             self.launch_game(config["game_path"])
+            self.register_launch_grace_period()
             self.push_log("OK", "Game launch triggered")
             self.send_webhook_event("manual launch triggered", "manual_launch")
         except Exception as exc:
@@ -1093,6 +1109,7 @@ class GW2MonitorApp(ctk.CTk):
             launched_ok = False
             try:
                 self.launch_game(config["game_path"])
+                self.register_launch_grace_period()
                 launched_ok = True
             except Exception as exc:
                 with self.state_lock:
@@ -1122,11 +1139,37 @@ class GW2MonitorApp(ctk.CTk):
             self.expected_game_down = False
             self.expected_game_down_reason = ""
 
+    def clean_webhook_content(self, text):
+        lines = [line.rstrip() for line in str(text).replace("\r\n", "\n").split("\n")]
+        cleaned = []
+        previous_blank = False
+
+        for line in lines:
+            compact = " ".join(line.split()) if line.strip() else ""
+            if not compact:
+                if not previous_blank and cleaned:
+                    cleaned.append("")
+                previous_blank = True
+                continue
+            cleaned.append(compact)
+            previous_blank = False
+
+        return "\n".join(cleaned).strip()
+
     def render_webhook_message(self, event, pid=None, session_start=None, session_length=None):
         config = self.get_runtime_config()
         now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user_id = config["discord_user_id"]
         mention = f"<@{user_id}>" if user_id else ""
+
+        if session_length:
+            uptime_text = session_length
+        elif session_start:
+            uptime_text = self.format_duration(time.time() - session_start)
+        else:
+            with self.state_lock:
+                started_at = self.runtime.game_started_at
+            uptime_text = self.format_duration(time.time() - started_at) if started_at else "00:00:00"
 
         replacements = {
             "mention": mention,
@@ -1136,13 +1179,94 @@ class GW2MonitorApp(ctk.CTk):
             "time": now_text,
             "pid": str(pid or "-"),
             "session_length": session_length or "",
+            "uptime": uptime_text,
             "restart_interval_hours": str(config["timed_restart_hours"]),
+            "session_start": datetime.fromtimestamp(session_start).strftime("%Y-%m-%d %H:%M:%S") if session_start else "-",
         }
 
         try:
-            return self.normalize_template(config["webhook_template"]).format(**replacements).strip()
+            rendered = self.normalize_template(config["webhook_template"]).format(**replacements)
         except Exception:
-            return f"{mention} {config['target_exe']} {event}\nTime: {now_text}\nPID: {pid or '-'}".strip()
+            fallback_lines = []
+            if mention:
+                fallback_lines.append(mention)
+            fallback_lines.append(f"``{config['target_exe']}`` {event}")
+            fallback_lines.append(f"Uptime: {uptime_text}")
+            fallback_lines.append(f"Time: {now_text}")
+            fallback_lines.append(f"PID: {pid or '-'}")
+            rendered = "\n".join(fallback_lines)
+
+        return self.clean_webhook_content(rendered)
+
+    def get_webhook_style(self, event_key, event):
+        event_lower = str(event).lower()
+
+        if event_key == "test":
+            return 0x5865F2, "GW2 Monitor Test", "Test webhook sent"
+        if event_key == "game_started":
+            return 0x57F287, "GW2 Started", "Game process detected"
+        if event_key == "unexpected_close":
+            return 0xED4245, "GW2 Closed", "Unexpected close detected"
+        if event_key == "restart_events":
+            if "failed" in event_lower:
+                return 0xED4245, "GW2 Restart", event
+            if "completed" in event_lower:
+                return 0x57F287, "GW2 Restart", event
+            return 0xFEE75C, "GW2 Restart", event
+        if event_key == "hide_show":
+            return 0x00C7D9, "GW2 Window State", event
+        if event_key == "manual_launch":
+            return 0x5865F2, "GW2 Launch", event
+        if event_key == "monitor_events":
+            if "started" in event_lower:
+                return 0x57F287, "GW2 Monitor", "Monitor started"
+            return 0xED4245, "GW2 Monitor", "Monitor stopped"
+        return 0x2B2D31, "GW2 Monitor", event
+
+    def build_webhook_payload(self, event, event_key, pid=None, session_start=None, session_length=None):
+        config = self.get_runtime_config()
+        now = datetime.now()
+        now_text = now.strftime("%Y-%m-%d %H:%M:%S")
+        user_id = config["discord_user_id"].strip()
+        mention = f"<@{user_id}>" if user_id else ""
+
+        if session_length:
+            uptime_text = session_length
+        elif session_start:
+            uptime_text = self.format_duration(time.time() - session_start)
+        else:
+            with self.state_lock:
+                started_at = self.runtime.game_started_at
+            uptime_text = self.format_duration(time.time() - started_at) if started_at else "00:00:00"
+
+        color, title, description = self.get_webhook_style(event_key, event)
+        rendered_line = self.render_webhook_message(event, pid=pid, session_start=session_start, session_length=session_length)
+        first_line = rendered_line.splitlines()[0] if rendered_line else f"``{config['target_exe']}`` {event}"
+
+        embed = {
+            "title": title,
+            "description": f"{first_line}\n{description}",
+            "color": color,
+            "fields": [
+                {"name": "Uptime", "value": uptime_text, "inline": True},
+                {"name": "PID", "value": str(pid or "-"), "inline": True},
+                {"name": "Time", "value": now_text, "inline": False},
+            ],
+            "footer": {
+                "text": "GW2 Background Monitor"
+            },
+            "timestamp": now.isoformat()
+        }
+
+        payload = {
+            "embeds": [embed],
+            "allowed_mentions": {"parse": ["users"]} if mention else {"parse": []},
+        }
+
+        if mention:
+            payload["content"] = mention
+
+        return payload
 
     def send_webhook_event(self, event, event_key, pid=None, session_start=None, session_length=None):
         webhook_url = self.get_runtime_config()["webhook_url"]
@@ -1152,12 +1276,19 @@ class GW2MonitorApp(ctk.CTk):
         if not self.should_notify(event_key):
             return
 
-        content = self.render_webhook_message(event, pid=pid, session_start=session_start, session_length=session_length)
-        threading.Thread(target=self.send_webhook_request, args=(webhook_url, content), daemon=True).start()
+        payload = self.build_webhook_payload(
+            event=event,
+            event_key=event_key,
+            pid=pid,
+            session_start=session_start,
+            session_length=session_length
+        )
 
-    def send_webhook_request(self, webhook_url, content):
+        threading.Thread(target=self.send_webhook_request, args=(webhook_url, payload), daemon=True).start()
+
+    def send_webhook_request(self, webhook_url, payload):
         try:
-            response = requests.post(webhook_url, json={"content": content}, timeout=10)
+            response = requests.post(webhook_url, json=payload, timeout=10)
 
             with self.state_lock:
                 if 200 <= response.status_code < 300:
@@ -1203,6 +1334,9 @@ class GW2MonitorApp(ctk.CTk):
         self.pending_start_time = None
         self.pending_detection_count = 0
         self.missed_detection_count = 0
+        self.expected_game_down = False
+        self.expected_game_down_reason = ""
+        self.suppress_unexpected_close_until = 0.0
 
         now = time.time()
 
@@ -1224,6 +1358,10 @@ class GW2MonitorApp(ctk.CTk):
             return
 
         self.monitor_stop_event.set()
+        self.expected_game_down = False
+        self.expected_game_down_reason = ""
+        self.suppress_unexpected_close_until = 0.0
+
         with self.state_lock:
             self.runtime.monitor_running = False
             self.runtime.restart_state = "Stopped"
@@ -1232,6 +1370,8 @@ class GW2MonitorApp(ctk.CTk):
         self.send_webhook_event("monitor stopped", "monitor_events")
 
     def mark_game_started_stable(self, config, pid, started_at):
+        self.register_launch_grace_period()
+
         with self.state_lock:
             self.runtime.game_running = True
             self.runtime.current_pid = pid
@@ -1252,7 +1392,11 @@ class GW2MonitorApp(ctk.CTk):
         except Exception:
             started_at = now
 
-        if self.runtime.current_pid == pid and self.runtime.game_running:
+        with self.state_lock:
+            current_pid = self.runtime.current_pid
+            game_running = self.runtime.game_running
+
+        if current_pid == pid and game_running:
             self.missed_detection_count = 0
             with self.state_lock:
                 self.runtime.current_exe_display = f"{config['target_exe']} (PID {pid})"
@@ -1280,7 +1424,10 @@ class GW2MonitorApp(ctk.CTk):
             self.pending_start_time = None
             self.pending_detection_count = 0
 
-        if self.runtime.current_pid is None:
+        with self.state_lock:
+            current_pid = self.runtime.current_pid
+
+        if current_pid is None:
             with self.state_lock:
                 self.runtime.game_running = False
                 self.runtime.current_pid = None
@@ -1294,12 +1441,15 @@ class GW2MonitorApp(ctk.CTk):
         if self.missed_detection_count < MISSED_POLLS_FOR_CLOSE:
             return
 
-        previous_pid = None
-        previous_start = None
-
         with self.state_lock:
             previous_pid = self.runtime.current_pid
             previous_start = self.runtime.game_started_at
+
+        if previous_pid and psutil.pid_exists(previous_pid):
+            self.missed_detection_count = 0
+            return
+
+        with self.state_lock:
             self.runtime.game_running = False
             self.runtime.current_pid = None
             self.runtime.current_exe_display = f"{config['target_exe']} (not detected)"
@@ -1315,11 +1465,15 @@ class GW2MonitorApp(ctk.CTk):
             self.push_log("MODE", f"Game closed for {self.expected_game_down_reason}")
             return
 
+        if now < self.suppress_unexpected_close_until:
+            self.push_log("INFO", "Close ignored during post launch grace period")
+            return
+
         with self.state_lock:
             self.runtime.close_events += 1
 
         self.push_log("WARN", f"Game closed after {session_length}")
-        self.send_webhook_event("game closed unexpectedly", "unexpected_close", pid=previous_pid)
+        self.send_webhook_event("game closed unexpectedly", "unexpected_close", pid=previous_pid, session_start=previous_start, session_length=session_length)
 
         if config["auto_restart_on_close"] and not self.restart_lock.locked():
             if now - self.get_last_restart_at() >= config["restart_cooldown"]:
@@ -1334,8 +1488,11 @@ class GW2MonitorApp(ctk.CTk):
             if process:
                 self.handle_detected_process(config, process, now)
 
+                with self.state_lock:
+                    game_started_at = self.runtime.game_started_at
+
                 if config["timed_restart_enabled"] and not self.restart_lock.locked():
-                    if self.runtime.game_started_at and now >= self.runtime.game_started_at + config["timed_restart_hours"] * 3600:
+                    if game_started_at and now >= game_started_at + config["timed_restart_hours"] * 3600:
                         if now - self.get_last_restart_at() >= config["restart_cooldown"]:
                             self.start_restart_sequence("timed restart")
             else:
@@ -1350,8 +1507,13 @@ class GW2MonitorApp(ctk.CTk):
                 time.sleep(0.1)
 
         with self.state_lock:
+            target_exe = self.get_runtime_config()["target_exe"]
             self.runtime.monitor_running = False
             self.runtime.game_running = False
+            self.runtime.current_pid = None
+            self.runtime.current_exe_display = f"{target_exe} (not detected)"
+            self.runtime.game_started_at = None
+            self.runtime.hidden_mode = False
             self.runtime.next_timed_restart_at = None
             self.runtime.restart_state = "Stopped"
 
@@ -1359,6 +1521,9 @@ class GW2MonitorApp(ctk.CTk):
         self.pending_start_time = None
         self.pending_detection_count = 0
         self.missed_detection_count = 0
+        self.expected_game_down = False
+        self.expected_game_down_reason = ""
+        self.suppress_unexpected_close_until = 0.0
 
         self.push_log("INFO", "Monitor stopped")
 
